@@ -199,6 +199,101 @@ Synapse. Therefore logging in again will not refresh the display name or email
 address.
 
 
+## Room Mapping
+
+The `room_mapping` feature allows you to automatically manage Matrix room memberships based on LDAP group membership. When a user authenticates, the module checks their LDAP group membership and automatically adds them to or removes them from configured Matrix rooms.
+
+### Configuration
+
+```yaml
+   modules:
+    - module: "ldap_auth_provider.LdapAuthProviderModule"
+      config:
+        enabled: true
+        mode: "search"
+        uri: "ldap://ldap.example.com:389"
+        start_tls: true
+        base: "ou=users,dc=example,dc=com"
+        attributes:
+           uid: "cn"
+           mail: "mail"
+           name: "givenName"
+        bind_dn: "cn=hacker,ou=svcaccts,dc=example,dc=com"
+        bind_password: "ch33kym0nk3y"
+        # Room mapping configuration
+        room_mapping:
+          - cn: "CN=Developers,OU=Groups,DC=example,DC=com"
+            rooms:
+              - "#dev-team:example.com"
+              - "#general:example.com"
+          - cn: "CN=Admins,OU=Groups,DC=example,DC=com"
+            rooms: "#admin-room:example.com"
+        # Optional: User to invite on behalf of (must have permission to invite)
+        room_inviter: "@admin:example.com"
+        # Optional: Enable nested groups support (Active Directory) - default: true
+        nested_groups: true
+```
+
+### How it works
+
+1. **Authentication**: When a user authenticates (login or registration), the module queries their LDAP group membership
+2. **Group Matching**: The module checks which configured groups (from `room_mapping`) the user belongs to
+3. **Room Synchronization**:
+   - **Add to rooms**: If the user is a member of an LDAP group, they are automatically added to the corresponding Matrix rooms
+   - **Remove from rooms**: If the user is no longer a member of an LDAP group, they are automatically removed from the corresponding Matrix rooms
+4. **Nested Groups**: When `nested_groups: true` (default), the module supports Active Directory nested group membership using the LDAP extensible match filter (OID 1.2.840.113556.1.4.1941)
+
+### Configuration options
+
+- **`room_mapping`** (list, optional): List of LDAP group to Matrix room mappings
+  - **`cn`** (string, required): Full Distinguished Name (DN) of the LDAP group
+  - **`rooms`** (string or list, required): Matrix room alias(es) or room ID(s) to manage
+    - Room aliases must start with `#` (e.g., `#room:example.com`)
+    - Room IDs must start with `!` (e.g., `!roomid:example.com`)
+- **`room_inviter`** (string, optional): Matrix user ID to use for inviting users to rooms
+  - Must be a valid Matrix user ID starting with `@` (e.g., `@admin:example.com`)
+  - This user must have permission to invite users to the configured rooms
+  - If not specified, the module will attempt to join users directly
+- **`nested_groups`** (boolean, optional, default: `true`): Enable support for nested groups in Active Directory
+  - When `true`, uses LDAP extensible match filter for transitive group membership
+  - When `false`, only checks direct group membership
+
+### Example scenarios
+
+**Scenario 1: Department-based room access**
+```yaml
+room_mapping:
+  - cn: "CN=Engineering,OU=Departments,DC=company,DC=com"
+    rooms:
+      - "#engineering:company.com"
+      - "#all-staff:company.com"
+  - cn: "CN=Sales,OU=Departments,DC=company,DC=com"
+    rooms:
+      - "#sales:company.com"
+      - "#all-staff:company.com"
+```
+
+**Scenario 2: Role-based access with nested groups**
+```yaml
+room_mapping:
+  - cn: "CN=Admins,OU=Groups,DC=company,DC=com"
+    rooms: "#admin-room:company.com"
+  - cn: "CN=Developers,OU=Groups,DC=company,DC=com"
+    rooms:
+      - "#dev-team:company.com"
+      - "#code-reviews:company.com"
+nested_groups: true  # Supports nested group membership
+room_inviter: "@bot:company.com"
+```
+
+### Important notes
+
+- Room synchronization happens during authentication (login) and user registration
+- The module only checks groups that are configured in `room_mapping`, not all LDAP groups
+- For Active Directory, `nested_groups: true` enables efficient nested group checking using native LDAP filters
+- The `room_inviter` user must exist and have appropriate permissions in the target rooms
+- Room aliases are resolved to room IDs automatically by Synapse
+
 ## Active Directory forest support
 
 If the ``active_directory`` flag is set to `true`, an Active Directory forest will be
@@ -208,8 +303,8 @@ In this mode, the user enters their login details in one of the forms:
 - `<login>/<domain>`
 - `<domain>\<login>`
 
-In either case, this will be mapped to the Matrix UID `<login>/<domain>` (The 
-normal AD domain separators, `@` and `\`, cannot be used in Matrix User Identifiers, so 
+In either case, this will be mapped to the Matrix UID `<login>/<domain>` (The
+normal AD domain separators, `@` and `\`, cannot be used in Matrix User Identifiers, so
 `/` is used instead.)
 
 Let's say you have several domains in the `example.com` forest:
