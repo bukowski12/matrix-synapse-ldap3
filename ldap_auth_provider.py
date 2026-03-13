@@ -60,6 +60,9 @@ class _LdapConfig:
     active_directory: Optional[str] = None
     default_domain: Optional[str] = None
     user_mapping: Optional[Dict[str, str]] = None
+    room_mapping: Optional[List[Dict[str, str]]] = None
+    room_inviter: Optional[str] = None
+    nested_groups: bool = True  # Enable nested groups support (Active Directory)
 
 
 SUPPORTED_LOGIN_TYPE: str = "m.login.password"
@@ -95,6 +98,10 @@ class LdapAuthProvider:
 
         # User mapping configuration
         self.user_mapping = config.user_mapping
+        # Room mapping configuration
+        self.room_mapping = config.room_mapping
+        self.room_inviter = config.room_inviter
+        self.nested_groups = config.nested_groups
 
     def get_supported_login_types(self) -> Dict[str, Tuple[str, ...]]:
         return {SUPPORTED_LOGIN_TYPE: SUPPORTED_LOGIN_FIELDS}
@@ -221,6 +228,425 @@ class LdapAuthProvider:
                     mapped_localpart)
         return mapped_localpart
 
+    async def _check_user_in_specific_groups(self, uid_value: str, password: str, target_groups: List[str]) -> List[str]:
+        """Check if user is member of specific LDAP groups (optimized version).
+
+        Args:
+            uid_value: User's LDAP uid value
+            password: User's password
+            target_groups: List of specific group DNs to check
+
+        Returns:
+            List of group DNs the user is actually member of
+        """
+        logger.debug("Checking user %s membership in %d specific groups", uid_value, len(target_groups))
+
+        matched_groups = []
+
+        try:
+            # Create server connection
+            server = self._get_server()
+
+            for group_dn in target_groups:
+                logger.debug("Checking membership in group: %s", group_dn)
+
+                # Create filter to check if user is member of this specific group
+                # Use LDAP_MATCHING_RULE_IN_CHAIN for nested groups support (Active Directory)
+                if self.nested_groups:
+                    # Nested groups: Use extensible match with transitive group membership
+                    search_filter = f"(&({self.ldap_attributes['uid']}={uid_value})(memberOf:1.2.840.113556.1.4.1941:={group_dn}))"
+                    logger.debug("LDAP filter with nested groups support: %s", search_filter)
+                else:
+                    # Direct membership only
+                    search_filter = f"(&({self.ldap_attributes['uid']}={uid_value})(memberOf={group_dn}))"
+                    logger.debug("LDAP filter (direct membership only): %s", search_filter)
+
+                # Perform targeted LDAP search
+                if self.ldap_mode == LDAPMode.SIMPLE:
+                    bind_dn = "{prop}={value},{base}".format(
+                        prop=self.ldap_attributes["uid"],
+                        value=uid_value,
+                        base=self.ldap_base,
+                    )
+                    result, conn = await self._ldap_simple_bind(
+                        server=server, bind_dn=bind_dn, password=password
+                    )
+                else:
+                    filters = [(self.ldap_attributes["uid"], uid_value)]
+                    result, conn, _ = await self._ldap_authenticated_search(
+                        server=server, password=password, filters=filters
+                    )
+
+                if not result:
+                    logger.debug("❌ Failed to bind for group check: %s", group_dn)
+                    continue
+
+                # Search with the specific group filter
+                conn.search(
+                    search_base=self.ldap_base,
+                    search_filter=search_filter,
+                    search_scope=ldap3.SUBTREE,
+                    attributes=['sAMAccountName']  # We only need to know if user exists
+                )
+
+                # If we get results, user is member of this group
+                if conn.entries and len(conn.entries) > 0:
+                    logger.debug("✅ User %s IS member of group: %s", uid_value, group_dn)
+                    matched_groups.append(group_dn)
+                else:
+                    logger.debug("❌ User %s is NOT member of group: %s", uid_value, group_dn)
+
+            logger.info("User %s belongs to %d/%d configured groups: %s",
+                       uid_value, len(matched_groups), len(target_groups), matched_groups)
+            return matched_groups
+
+        except Exception as e:
+            logger.error("Failed to check specific group membership for user %s: %s", uid_value, e, exc_info=True)
+            return []
+
+    async def _get_user_ldap_groups(self, uid_value: str, password: str) -> List[str]:
+        """Get LDAP groups for a user (optimized to check only configured groups).
+
+        Args:
+            uid_value: User's LDAP uid value
+            password: User's password
+
+        Returns:
+            List of LDAP group DNs the user belongs to (only from configured room_mapping)
+        """
+        logger.debug("Getting LDAP groups for user: %s (optimized version)", uid_value)
+
+        # Extract target groups from room_mapping configuration
+        target_groups = []
+        for mapping in self.room_mapping:
+            group_cn = mapping.get('cn')
+            if group_cn and group_cn not in target_groups:
+                target_groups.append(group_cn)
+
+        if not target_groups:
+            logger.warning("No target groups configured in room_mapping")
+            return []
+
+        logger.debug("Checking user %s against %d configured groups instead of loading all groups",
+                    uid_value, len(target_groups))
+
+        # Use optimized method to check only specific groups
+        return await self._check_user_in_specific_groups(uid_value, password, target_groups)
+
+    async def _sync_user_rooms(self, user_id: str, user_groups: List[str]) -> None:
+        """Synchronize user's room memberships based on LDAP groups.
+
+        Ensures user is in correct rooms and removes them from rooms they shouldn't be in.
+
+        Args:
+            user_id: Matrix user ID (e.g., '@user:domain.com')
+            user_groups: List of LDAP group DNs the user belongs to
+        """
+        if not self.room_mapping:
+            logger.debug("No room mapping configured, skipping room sync")
+            return
+
+        logger.debug("Syncing rooms for user %s with groups: %s", user_id, user_groups)
+
+        # Determine which rooms the user should be in based on their groups
+        target_rooms = set()
+        rooms_to_remove_from = set()  # Rooms to remove from (based on lost group membership)
+
+        # Process each mapping to determine target rooms and removal candidates
+        for mapping in self.room_mapping:
+            group_cn = mapping.get('cn')
+            rooms = mapping.get('rooms')
+
+            if not group_cn or not rooms:
+                logger.warning("Invalid room mapping entry: %s", mapping)
+                continue
+
+            # rooms can be either a string or a list
+            if isinstance(rooms, str):
+                rooms_list = [rooms]
+            elif isinstance(rooms, list):
+                rooms_list = rooms
+            else:
+                logger.warning("Invalid rooms format in mapping: %s", mapping)
+                continue
+
+            # Check if user belongs to this group
+            if group_cn in user_groups:
+                # User HAS this group - add all rooms for this group to target rooms
+                for room_id in rooms_list:
+                    target_rooms.add(room_id)
+                    logger.debug("User %s should be in room %s (has group: %s)", user_id, room_id, group_cn)
+            else:
+                # User DOESN'T have this group - these rooms are candidates for removal
+                # (but only if user was previously in them due to this group)
+                for room_id in rooms_list:
+                    rooms_to_remove_from.add(room_id)
+                    logger.debug("User %s should NOT be in room %s (lost group: %s)", user_id, room_id, group_cn)
+
+        # Remove rooms that are in both sets (user should be in them due to current groups)
+        rooms_to_actually_remove = rooms_to_remove_from - target_rooms
+
+        # Log comprehensive sync information
+        logger.info("User %s room synchronization:", user_id)
+        logger.info("  - User groups: %s", user_groups)
+        logger.info("  - Target rooms (based on current groups): %d", len(target_rooms))
+        logger.info("  - Rooms to remove (lost group access): %d", len(rooms_to_actually_remove))
+
+        if target_rooms:
+            logger.info("  - Should be in rooms: %s", list(target_rooms))
+        else:
+            logger.info("  - Should be in rooms: NONE (no matching groups)")
+
+        # 1. Add user to rooms they should be in (based on current groups)
+        for room_alias in target_rooms:
+            try:
+                await self._ensure_user_in_room(user_id, room_alias)
+            except Exception as e:
+                logger.error("Failed to join user %s to room %s: %s", user_id, room_alias, e)
+
+        # 2. Remove user from rooms where they lost group membership
+        # This only removes from rooms where user lost the LDAP group, not config changes
+        if rooms_to_actually_remove:
+            logger.info("  - Should be removed from rooms: %s (lost group membership)", list(rooms_to_actually_remove))
+            logger.info("User %s will be removed from %d rooms due to lost group membership", user_id, len(rooms_to_actually_remove))
+            for room_alias in rooms_to_actually_remove:
+                try:
+                    await self._ensure_user_not_in_room(user_id, room_alias)
+                except Exception as e:
+                    logger.error("Failed to remove user %s from room %s: %s", user_id, room_alias, e)
+        else:
+            logger.info("  - Should be removed from rooms: NONE (no lost group memberships)")
+            logger.debug("No rooms to remove user %s from based on group membership", user_id)
+
+    async def _ensure_user_in_room(self, user_id: str, room_identifier: str) -> None:
+        """Ensure user is in the specified room.
+
+        Args:
+            user_id: Matrix user ID (e.g., '@user:domain.com')
+            room_identifier: Room alias (e.g., '#developers:domain.com') or Room ID (e.g., '!abc123:domain.com')
+        """
+        try:
+            if hasattr(self.account_handler, '_hs'):
+                hs = self.account_handler._hs
+                room_member_handler = hs.get_room_member_handler()
+
+                # Determine if we have room ID or alias
+                if room_identifier.startswith('!'):
+                    # It's already a room ID
+                    room_id = room_identifier
+                    logger.debug("Using room ID directly: %s", room_id)
+                elif room_identifier.startswith('#'):
+                    # It's a room alias, need to resolve to room ID
+                    try:
+                        directory_handler = hs.get_directory_handler()
+                        room_alias_result = await directory_handler.get_association(room_identifier)
+                        room_id = room_alias_result.room_id
+                        logger.debug("Resolved room alias %s to room ID %s", room_identifier, room_id)
+                    except Exception as e:
+                        logger.warning("Could not resolve room alias %s: %s", room_identifier, e)
+                        return
+                else:
+                    logger.warning("Invalid room identifier format: %s (must start with # or !)", room_identifier)
+                    return
+
+                # Check if user is already in the room using ModuleApi
+                try:
+                    if hasattr(hs, 'get_module_api'):
+                        api = hs.get_module_api()
+                        # Use get_room_state with filter for specific member event
+                        event_filter = [("m.room.member", user_id)]
+                        room_state = await api.get_room_state(room_id, event_filter)
+
+                        # Check if user's member event exists and has "join" membership
+                        member_key = ("m.room.member", user_id)
+                        if member_key in room_state:
+                            member_event = room_state[member_key]
+                            if hasattr(member_event, 'content') and member_event.content.get("membership") == "join":
+                                logger.debug("User %s is already in room %s", user_id, room_identifier)
+                                return
+                    else:
+                        logger.debug("ModuleApi not available for membership check")
+
+                except Exception as e:
+                    logger.debug("Could not check current membership for %s in %s: %s",
+                                user_id, room_identifier, e)
+
+                # Join user to room
+                logger.info("Joining user %s to room %s (%s)", user_id, room_identifier, room_id)
+
+                # Try to actually join the room using ModuleApi
+                try:
+                    if hasattr(hs, 'get_module_api'):
+                        api = hs.get_module_api()
+
+                        if self.room_inviter:
+                            # Use inviter to invite user, then user joins
+                            logger.info("Using inviter %s to invite %s to room %s",
+                                       self.room_inviter, user_id, room_id)
+
+                            # First invite
+                            await api.update_room_membership(
+                                sender=self.room_inviter,
+                                target=user_id,
+                                room_id=room_id,
+                                new_membership="invite"
+                            )
+
+                            # Then join
+                            await api.update_room_membership(
+                                sender=user_id,
+                                target=user_id,
+                                room_id=room_id,
+                                new_membership="join"
+                            )
+
+                            logger.info("Successfully added user %s to room %s via invite", user_id, room_identifier)
+
+                        else:
+                            # Try direct join
+                            logger.info("Attempting direct join for %s to room %s", user_id, room_id)
+
+                            await api.update_room_membership(
+                                sender=user_id,
+                                target=user_id,
+                                room_id=room_id,
+                                new_membership="join"
+                            )
+
+                            logger.info("Successfully joined user %s to room %s directly", user_id, room_identifier)
+                    else:
+                        # Fallback to logging
+                        logger.warning("ModuleApi not available - cannot join rooms automatically")
+                        if self.room_inviter:
+                            logger.info("MANUAL ACTION: %s should invite %s to %s",
+                                       self.room_inviter, user_id, room_identifier)
+                        else:
+                            logger.info("MANUAL ACTION: %s should join %s", user_id, room_identifier)
+
+                except Exception as join_error:
+                    logger.warning("Failed to join room %s: %s", room_identifier, join_error)
+                    # Fallback to manual instructions
+                    if self.room_inviter:
+                        logger.info("MANUAL ACTION: %s should invite %s to %s",
+                                   self.room_inviter, user_id, room_identifier)
+                    else:
+                        logger.info("MANUAL ACTION: %s should join %s", user_id, room_identifier)
+
+            else:
+                logger.warning("Cannot access Synapse homeserver instance for room operations")
+                logger.info("Would join user %s to room %s", user_id, room_identifier)
+
+        except Exception as e:
+            logger.error("Failed to ensure user %s is in room %s: %s", user_id, room_identifier, e)
+
+    async def _ensure_user_not_in_room(self, user_id: str, room_identifier: str) -> None:
+        """Ensure user is NOT in the specified room (remove them if they are).
+
+        Args:
+            user_id: Matrix user ID (e.g., '@user:domain.com')
+            room_identifier: Room ID (!abc:domain.com) or alias (#name:domain.com)
+        """
+        try:
+            if hasattr(self.account_handler, '_hs'):
+                hs = self.account_handler._hs
+
+                # Determine if we have room ID or alias
+                if room_identifier.startswith('!'):
+                    room_id = room_identifier
+                elif room_identifier.startswith('#'):
+                    # Resolve room alias to room ID
+                    try:
+                        room_alias_handler = hs.get_room_alias_handler()
+                        room_id, _ = await room_alias_handler.get_association(room_identifier)
+                    except Exception as e:
+                        logger.warning("Could not resolve room alias %s: %s", room_identifier, e)
+                        return
+                else:
+                    logger.warning("Invalid room identifier format: %s (must start with # or !)", room_identifier)
+                    return
+
+                # Check if user is currently in the room using ModuleApi
+                try:
+                    if hasattr(hs, 'get_module_api'):
+                        api = hs.get_module_api()
+                        # Use get_room_state with filter for specific member event
+                        event_filter = [("m.room.member", user_id)]
+                        room_state = await api.get_room_state(room_id, event_filter)
+
+                        # Check if user's member event exists and has "join" membership
+                        member_key = ("m.room.member", user_id)
+                        if member_key in room_state:
+                            member_event = room_state[member_key]
+                            if hasattr(member_event, 'content') and member_event.content.get("membership") == "join":
+                                logger.info("Removing user %s from room %s (%s)", user_id, room_identifier, room_id)
+
+                                # Remove user from room
+                                await self._remove_user_from_room(user_id, room_id, room_identifier, api)
+                            else:
+                                logger.debug("User %s is not joined to room %s (membership: %s)",
+                                           user_id, room_identifier,
+                                           member_event.content.get("membership", "unknown") if hasattr(member_event, 'content') else "no-content")
+                        else:
+                            logger.debug("User %s is not in room %s", user_id, room_identifier)
+                    else:
+                        logger.debug("ModuleApi not available for membership check")
+
+                except Exception as e:
+                    logger.debug("Could not check current membership for %s in %s: %s",
+                                user_id, room_identifier, e)
+
+            else:
+                logger.warning("Cannot access Synapse homeserver instance for room operations")
+
+        except Exception as e:
+            logger.error("Failed to ensure user %s is not in room %s: %s", user_id, room_identifier, e)
+
+    async def _remove_user_from_room(self, user_id: str, room_id: str, room_identifier: str, api) -> None:
+        """Remove user from room using ModuleApi.
+
+        Args:
+            user_id: Matrix user ID
+            room_id: Room ID (!abc:domain.com)
+            room_identifier: Original room identifier for logging
+            api: ModuleApi instance
+        """
+        try:
+            if self.room_inviter:
+                # Use inviter to kick user from room
+                logger.info("Using inviter %s to remove %s from room %s",
+                           self.room_inviter, user_id, room_id)
+
+                await api.update_room_membership(
+                    sender=self.room_inviter,
+                    target=user_id,
+                    room_id=room_id,
+                    new_membership="leave"
+                )
+
+                logger.info("Successfully removed user %s from room %s", user_id, room_identifier)
+
+            else:
+                # User leaves themselves
+                logger.info("User %s leaving room %s (no inviter configured)", user_id, room_id)
+
+                await api.update_room_membership(
+                    sender=user_id,
+                    target=user_id,
+                    room_id=room_id,
+                    new_membership="leave"
+                )
+
+                logger.info("Successfully removed user %s from room %s", user_id, room_identifier)
+
+        except Exception as leave_error:
+            logger.warning("Failed to remove user %s from room %s: %s", user_id, room_identifier, leave_error)
+            # Fallback to manual instructions
+            if self.room_inviter:
+                logger.info("MANUAL ACTION: %s should kick %s from %s",
+                           self.room_inviter, user_id, room_identifier)
+            else:
+                logger.info("MANUAL ACTION: %s should leave %s", user_id, room_identifier)
+
     async def check_auth(
         self, username: str, login_type: str, login_dict: Dict[str, Any]
     ) -> Optional[str]:
@@ -324,6 +750,12 @@ class LdapAuthProvider:
                     existing_user_id,
                     localpart,
                 )
+
+                # Sync room memberships for existing user
+                if self.room_mapping:
+                    user_groups = await self._get_user_ldap_groups(uid_value, password)
+                    await self._sync_user_rooms(existing_user_id, user_groups)
+
                 if hasattr(conn, "unbind"):
                     await threads.deferToThread(conn.unbind)
                 return existing_user_id
@@ -371,10 +803,16 @@ class LdapAuthProvider:
                     display_name = default_display_name
                     mail = None
 
+                # Get user's LDAP groups for room synchronization
+                user_groups = []
+                if self.room_mapping:
+                    user_groups = await self._get_user_ldap_groups(uid_value, password)
+
                 # Register the user with mapped localpart
                 user_id = await self.register_user(
                     mapped_localpart.lower(), display_name, mail,
-                    already_mapped=True, original_localpart=localpart.lower()
+                    already_mapped=True, original_localpart=localpart.lower(),
+                    user_groups=user_groups
                 )
 
                 return user_id
@@ -455,8 +893,17 @@ class LdapAuthProvider:
             )
             givenName = givenName[0] if len(givenName) == 1 else localpart
 
-            # Register the user
-            user_id = await self.register_user(localpart, givenName, address)
+            # Get user groups for room synchronization
+            user_groups = []
+            if self.room_mapping:
+                user_groups = await self._get_user_ldap_groups(localpart, password)
+
+            # Register the user (or get existing user)
+            user_id = await self.register_user(localpart, givenName, address, user_groups=user_groups)
+
+            # For existing users, register_user doesn't sync rooms, so we need to do it here
+            if self.room_mapping and user_groups:
+                await self._sync_user_rooms(user_id, user_groups)
 
             return user_id
 
@@ -464,7 +911,7 @@ class LdapAuthProvider:
             logger.warning("Error during ldap authentication: %s", e)
             raise
 
-    async def register_user(self, localpart: str, name: str, email_address: str, already_mapped: bool = False, original_localpart: str = None) -> str:
+    async def register_user(self, localpart: str, name: str, email_address: str, already_mapped: bool = False, original_localpart: str = None, user_groups: List[str] = None) -> str:
         """Register a Synapse user, first checking if they exist.
 
         Args:
@@ -473,6 +920,7 @@ class LdapAuthProvider:
             email_address: Email address of the user.
             already_mapped: If True, localpart is already mapped and won't be mapped again.
             original_localpart: Original LDAP localpart (for storing in user_external_ids).
+            user_groups: List of LDAP groups the user belongs to (for room synchronization).
 
         Returns:
             user_id: User ID of the newly registered user.
@@ -522,6 +970,10 @@ class LdapAuthProvider:
             "Registration based on LDAP data was successful: %s",
             user_id,
         )
+
+        # Sync room memberships for newly registered user
+        if user_groups and self.room_mapping:
+            await self._sync_user_rooms(user_id, user_groups)
 
         return user_id
 
@@ -770,6 +1222,49 @@ class LdapAuthProvider:
                     )
 
             ldap_config.user_mapping = user_mapping
+
+        # Parse room_mapping configuration
+        room_mapping = config.get("room_mapping")
+        if room_mapping:
+            if not isinstance(room_mapping, list):
+                raise ValueError("room_mapping must be a list")
+
+            for mapping in room_mapping:
+                if not isinstance(mapping, dict):
+                    raise ValueError("Each room_mapping entry must be a dictionary")
+
+                if "cn" not in mapping or "rooms" not in mapping:
+                    raise ValueError("Each room_mapping entry must have 'cn' and 'rooms' keys")
+
+                if not isinstance(mapping["cn"], str):
+                    raise ValueError("room_mapping 'cn' value must be a string")
+
+                # rooms can be either a string or a list of strings
+                rooms = mapping["rooms"]
+                if isinstance(rooms, str):
+                    rooms_list = [rooms]
+                elif isinstance(rooms, list):
+                    rooms_list = rooms
+                    if not all(isinstance(room, str) for room in rooms_list):
+                        raise ValueError("room_mapping 'rooms' list must contain only strings")
+                else:
+                    raise ValueError("room_mapping 'rooms' must be a string or list of strings")
+
+                # Validate room identifier formats
+                for room_id in rooms_list:
+                    if not (room_id.startswith('#') or room_id.startswith('!')):
+                        raise ValueError(f"room_mapping 'rooms' value must be room alias (#room:domain) or room ID (!id:domain), got: {room_id}")
+
+            ldap_config.room_mapping = room_mapping
+
+        # Parse room_inviter configuration
+        room_inviter = config.get("room_inviter")
+        if room_inviter:
+            if not isinstance(room_inviter, str):
+                raise ValueError("room_inviter must be a string (Matrix user ID)")
+            if not room_inviter.startswith('@'):
+                raise ValueError("room_inviter must be a valid Matrix user ID (e.g., @admin:domain.com)")
+            ldap_config.room_inviter = room_inviter
 
         if "validate_cert" in config and "tls_options" in config:
             raise Exception(
