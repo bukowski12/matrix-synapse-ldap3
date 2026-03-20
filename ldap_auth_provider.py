@@ -21,12 +21,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import ldap3
 import ldap3.core.exceptions
 import synapse
-from pkg_resources import parse_version
+from packaging.version import parse as parse_version
 from synapse.module_api import ModuleApi
 from synapse.types import JsonDict
 from twisted.internet import threads
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 logger = logging.getLogger(__name__)
 
@@ -682,7 +682,7 @@ class LdapAuthProvider:
 
         if self.ldap_active_directory:
             try:
-                (login, domain, localpart) = await self._map_login_to_upn(username)
+                login, domain, localpart = await self._map_login_to_upn(username)
                 uid_value = login + "@" + domain
                 default_display_name = login
             except ActiveDirectoryUPNException:
@@ -878,7 +878,7 @@ class LdapAuthProvider:
             localpart = response["attributes"].get(self.ldap_attributes["uid"], [None])
             localpart = localpart[0] if len(localpart) == 1 else None
             if self.ldap_active_directory and localpart and "@" in localpart:
-                (login, domain) = localpart.lower().rsplit("@", 1)
+                login, domain = localpart.lower().rsplit("@", 1)
                 localpart = login + "/" + domain
 
                 if (
@@ -1151,9 +1151,11 @@ class LdapAuthProvider:
 
         ldap_config = _LdapConfig(
             enabled=config.get("enabled", False),
-            mode=LDAPMode.SEARCH
-            if config.get("mode", "simple") == "search"
-            else LDAPMode.SIMPLE,
+            mode=(
+                LDAPMode.SEARCH
+                if config.get("mode", "simple") == "search"
+                else LDAPMode.SIMPLE
+            ),
             uri=config["uri"],
             start_tls=config.get("start_tls", False),
             tls_options=config.get("tls_options"),
@@ -1547,12 +1549,12 @@ class LdapAuthProvider:
         domain = self.ldap_default_domain
 
         if "\\" in username:
-            (domain, login) = username.lower().rsplit("\\", 1)
+            domain, login = username.lower().rsplit("\\", 1)
             ldap_root_domain = await self._fetch_root_domain()
             if ldap_root_domain and not domain.endswith(ldap_root_domain):
                 domain += "." + ldap_root_domain
         elif "/" in username:
-            (login, domain) = username.lower().rsplit("/", 1)
+            login, domain = username.lower().rsplit("/", 1)
         elif not self.ldap_default_domain:
             logger.info(
                 'No LDAP separator "/" was found in uid "%s" '
