@@ -178,7 +178,7 @@ class LdapAuthProvider:
         logger.debug("Extracted original localpart '%s' from '%s' using template '%s'",
                     original, mapped_localpart, template)
         return original
-        
+
     async def _reverse_user_mapping(self, mapped_localpart: str) -> str:
         """Reverse user mapping to get original localpart for LDAP queries.
 
@@ -911,7 +911,7 @@ class LdapAuthProvider:
             logger.warning("Error during ldap authentication: %s", e)
             raise
 
-    async def register_user(self, localpart: str, name: str, email_address: str, already_mapped: bool = False, original_localpart: str = None, user_groups: List[str] = None) -> str:
+    async def register_user(self, localpart: str, name: str, email_address: str, already_mapped: bool = False, original_localpart: Optional[str] = None) -> str:
         """Register a Synapse user, first checking if they exist.
 
         Args:
